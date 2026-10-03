@@ -83,8 +83,17 @@ jobs:
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
 
+      # Chronos refuses a Release configure without a future beta end date.
+      # Repo variable CHRONOS_BETA_END pins one; otherwise today + 30 days.
+      - name: Beta end date
+        shell: bash
+        run: |
+          END="${{ vars.CHRONOS_BETA_END }}"
+          [ -n "$END" ] || END=$(date -u -d '+30 days' +%F 2>/dev/null || date -u -v+30d +%F)
+          echo "CHRONOS_BETA_END=$END" >> "$GITHUB_ENV"
+
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHRONOS_BETA_END=${{ env.CHRONOS_BETA_END }}
 
       - name: Build
         run: cmake --build build --config Release -j
@@ -94,7 +103,32 @@ jobs:
         run: |
           cd build/Chronos_artefacts/Release
           zip -r -y "$GITHUB_WORKSPACE/Chronos-${{ github.event.inputs.version }}-macOS.zip" \
-            Chronos.vst3 Chronos.component Standalone/Chronos.app
+            VST3/Chronos.vst3 AU/Chronos.component Standalone/Chronos.app
+
+      # Unsigned for now: Gatekeeper quarantines the download, so the image
+      # carries a note on clearing it. Drag targets cover the system folders.
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          A=build/Chronos_artefacts/Release
+          S="$RUNNER_TEMP/Chronos"
+          mkdir -p "$S"
+          cp -R "$A/VST3/Chronos.vst3" "$A/AU/Chronos.component" "$A/Standalone/Chronos.app" "$S/"
+          ln -s /Library/Audio/Plug-Ins/VST3 "$S/VST3 Plug-Ins"
+          ln -s /Library/Audio/Plug-Ins/Components "$S/AU Plug-Ins (Components)"
+          ln -s /Applications "$S/Applications"
+          cat > "$S/Install.txt" <<'EOF'
+          Drag Chronos.vst3 onto "VST3 Plug-Ins", Chronos.component onto
+          "AU Plug-Ins (Components)", and Chronos.app onto "Applications".
+
+          This beta is not signed yet. If macOS or your DAW blocks it, run this
+          once in Terminal, then rescan plug-ins in your DAW:
+
+          sudo xattr -dr com.apple.quarantine /Library/Audio/Plug-Ins/VST3/Chronos.vst3 /Library/Audio/Plug-Ins/Components/Chronos.component /Applications/Chronos.app
+          EOF
+          hdiutil create -volname "Chronos" -srcfolder "$S" -ov -format UDZO \
+            "$GITHUB_WORKSPACE/Chronos-${{ github.event.inputs.version }}-macOS.dmg"
 
       - name: Collect artifacts (Windows)
         if: runner.os == 'Windows'
@@ -116,12 +150,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Chronos-${{ github.event.inputs.version }}-${{ matrix.name }}
-          path: Chronos-*.zip
+          path: |
+            Chronos-*.zip
+            Chronos-*.dmg
           if-no-files-found: error
 
   release:
     name: Publish release
     needs: build
+    # Publish whatever built; the macOS DMG is the one required asset.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -134,6 +172,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.event.inputs.version }}" dist/Chronos-*.zip \
+          ls dist/Chronos-*-macOS.dmg
+          gh release create "${{ github.event.inputs.version }}" dist/Chronos-* \
             --title "Chronos ${{ github.event.inputs.version }}" \
             --notes "Built from marsDSP/Chronos @ ${{ github.event.inputs.ref }}."
