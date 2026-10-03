@@ -1,7 +1,8 @@
 name: Release build
 
-# Dispatched by marsDSP/Chronos's beta.yml workflow (never run directly on
-# a fork/PR here). Builds the private source at the given ref and publishes
+# Dispatched by marsDSP/Chronos's release-dispatch.yml (called from beta.yml
+# and linux.yml; never run directly on a fork/PR here). Builds the private
+# source at the given ref for the requested platforms and publishes
 # the resulting binaries as a release in THIS repo. Source is checked out
 # into an ephemeral runner workspace only — never committed here.
 on:
@@ -13,6 +14,13 @@ on:
       version:
         description: "Version label for the release title"
         required: true
+      # Chronos dispatches macOS + Windows once its macOS CI is green, and
+      # Linux once its Linux CI is green, with the same version, so both
+      # land in one release.
+      platforms:
+        description: 'JSON array of platforms to build ("macOS", "Windows", "Linux")'
+        required: false
+        default: '["macOS","Windows","Linux"]'
 
 permissions:
   contents: write
@@ -24,17 +32,14 @@ concurrency:
 jobs:
   build:
     name: Build (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    # The matrix is the requested platform list; the runner image comes from
+    # this map, since include entries cannot be filtered by an input. Linux
+    # is pinned: ubuntu-latest moves to Ubuntu 26 from 2026-10-19.
+    runs-on: ${{ fromJSON('{"macOS":"macos-latest","Windows":"windows-latest","Linux":"ubuntu-24.04"}')[matrix.name] }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            name: macOS
-          - os: windows-latest
-            name: Windows
-          - os: ubuntu-latest
-            name: Linux
+        name: ${{ fromJSON(github.event.inputs.platforms || '["macOS","Windows","Linux"]') }}
     steps:
       - name: Checkout Chronos source (private, transient)
         uses: actions/checkout@v4
@@ -82,6 +87,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-14 g++-14
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+          # As in Chronos's linux.yml: the LTO static libraries need GCC 14's
+          # ar/ranlib wrappers, or the plugin link misses juce:: symbols.
+          echo "CMAKE_EXTRA=-DCMAKE_AR=/usr/bin/gcc-ar-14 -DCMAKE_RANLIB=/usr/bin/gcc-ranlib-14" >> "$GITHUB_ENV"
 
       # Chronos refuses a Release configure without a future beta end date.
       # Repo variable CHRONOS_BETA_END pins one; otherwise today + 30 days.
@@ -93,10 +101,12 @@ jobs:
           echo "CHRONOS_BETA_END=$END" >> "$GITHUB_ENV"
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHRONOS_BETA_END=${{ env.CHRONOS_BETA_END }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHRONOS_BETA_END=${{ env.CHRONOS_BETA_END }} ${{ env.CMAKE_EXTRA }}
 
+      # A bare -j is unbounded under make: the Linux runner was shut down
+      # mid-compile. Four jobs match the hosted runners' core counts.
       - name: Build
-        run: cmake --build build --config Release -j
+        run: cmake --build build --config Release --parallel 4
 
       - name: Collect artifacts (macOS)
         if: runner.os == 'macOS'
@@ -158,7 +168,10 @@ jobs:
   release:
     name: Publish release
     needs: build
-    # Publish whatever built; the macOS DMG is the one required asset.
+    # Publish whatever built; the macOS DMG is required when macOS was
+    # requested. A dispatch whose version already has a release adds its
+    # assets to it. The per-ref concurrency group serialises the two
+    # dispatches of one commit, so they never race on the create.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -171,8 +184,17 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.event.inputs.version }}
+          REF: ${{ github.event.inputs.ref }}
+          PLATFORMS: ${{ github.event.inputs.platforms || '["macOS","Windows","Linux"]' }}
         run: |
-          ls dist/Chronos-*-macOS.dmg
-          gh release create "${{ github.event.inputs.version }}" dist/Chronos-* \
-            --title "Chronos ${{ github.event.inputs.version }}" \
-            --notes "Built from marsDSP/Chronos @ ${{ github.event.inputs.ref }}."
+          set -euo pipefail
+          case "$PLATFORMS" in *macOS*) ls dist/Chronos-*-macOS.dmg ;; esac
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/Chronos-* --clobber
+          else
+            gh release create "$VERSION" dist/Chronos-* \
+              --title "Chronos $VERSION" \
+              --notes "Built from marsDSP/Chronos @ $REF."
+          fi
