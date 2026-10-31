@@ -1,5 +1,7 @@
 # Chronos — Releases
 
+<img src="img/chronos.png" alt="The Chronos plugin interface" width="560">
+
 This repository hosts **release binaries only** for Chronos, a Nonlinear
 Delay Engine audio plugin (Standalone, VST3, and AU on macOS).
 
